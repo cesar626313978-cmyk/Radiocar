@@ -980,10 +980,10 @@ export default function App() {
       )}
 
       {/* Main Cabin Layout:
-          - Driving Split-Screen / Mobile (<1024px): Single toggleable view inside calc(100dvh - 64px) with zero vertical scroll
+          - Driving Split-Screen / Mobile (<1024px): Single toggleable view inside remaining viewport height with zero vertical scroll
           - Tesla Full Widescreen (>=1024px): Left Panel 40% (Stations) / Right Panel 60% (Main Player)
       */}
-      <main className="h-[calc(100dvh-64px)] w-full max-w-[1920px] mx-auto p-2.5 sm:p-4 lg:p-6 flex flex-col lg:flex-row gap-4 lg:gap-6 overflow-hidden">
+      <main className="flex-1 min-h-0 w-full max-w-[1920px] mx-auto p-2.5 sm:p-4 lg:p-6 flex flex-col lg:flex-row gap-4 lg:gap-6 overflow-hidden">
         {/* Right Panel on Desktop (60%) / Toggleable Player View on <1024px */}
         <div
           className={`${
