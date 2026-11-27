@@ -1,12 +1,25 @@
-import { Station, GenreFilter } from '../types/radio';
+import { Station, GenreFilter, CountryFilter } from '../types/radio';
 
 export const GENRE_FILTERS: GenreFilter[] = [
   'Todas',
   'Favoritas',
+  'España',
   'Noticias/Deportes',
   'Rock & Clásicos',
   'Hits / Pop',
   'Chill / Electrónica',
+];
+
+export const COUNTRY_OPTIONS: { code: CountryFilter; label: string }[] = [
+  { code: 'ALL', label: 'País: Todos' },
+  { code: 'ES', label: 'España (ES)' },
+  { code: 'GB', label: 'Reino Unido (GB)' },
+  { code: 'US', label: 'EE. UU. (US)' },
+  { code: 'FR', label: 'Francia (FR)' },
+  { code: 'IT', label: 'Italia (IT)' },
+  { code: 'DE', label: 'Alemania (DE)' },
+  { code: 'AR', label: 'Argentina (AR)' },
+  { code: 'MX', label: 'México (MX)' },
 ];
 
 export const INITIAL_STATIONS: Station[] = [

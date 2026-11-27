@@ -5,9 +5,18 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import Hls from 'hls.js';
+import { AlertCircle } from 'lucide-react';
 import { INITIAL_STATIONS } from './data/stations';
-import { EQSettings, GenreFilter, PlaybackStatus, Station } from './types/radio';
+import {
+  BrokenStationEntry,
+  CountryFilter,
+  EQSettings,
+  GenreFilter,
+  PlaybackStatus,
+  Station,
+} from './types/radio';
 import { storageService } from './utils/storage';
+import { radioBrowserService } from './services/radioBrowserService';
 import { HeaderBar } from './components/HeaderBar';
 import { StationBrowser } from './components/StationBrowser';
 import { MainPlayer } from './components/MainPlayer';
@@ -15,25 +24,59 @@ import { EqualizerModal } from './components/EqualizerModal';
 import { AddStationModal } from './components/AddStationModal';
 
 export default function App() {
-  // 1. Persisted Catalog & Theme State
+  // 1. Persisted Catalog, Saved Global Stations, Blacklist & Theme State
   const [customStations, setCustomStations] = useState<Station[]>(() =>
     storageService.getCustomStations()
   );
-  const allStations = useMemo(
-    () => [...INITIAL_STATIONS, ...customStations],
-    [customStations]
-  );
+
+  const [savedGlobalStations, setSavedGlobalStations] = useState<
+    Record<string, Station>
+  >(() => storageService.getSavedGlobalStations());
+
+  const [brokenStations, setBrokenStations] = useState<
+    Record<string, BrokenStationEntry>
+  >(() => storageService.getBrokenStations());
+
+  const [apiStations, setApiStations] = useState<Station[]>([]);
+  const [isApiLoading, setIsApiLoading] = useState<boolean>(false);
 
   const [themeMode, setThemeMode] = useState<'night' | 'day'>(() =>
     storageService.getThemeMode()
   );
 
+  // Build combined local + saved pool (excluding broken stations)
+  const localAndSavedPool = useMemo(() => {
+    const map = new Map<string, Station>();
+    for (const s of INITIAL_STATIONS) {
+      map.set(s.id, s);
+    }
+    for (const s of customStations) {
+      map.set(s.id, s);
+    }
+    for (const s of Object.values(savedGlobalStations)) {
+      if (!map.has(s.id)) {
+        map.set(s.id, s);
+      }
+    }
+    return Array.from(map.values());
+  }, [customStations, savedGlobalStations]);
+
   const [currentStation, setCurrentStation] = useState<Station>(() => {
     const savedId = storageService.getLastStationId(INITIAL_STATIONS[0].id);
-    const found = [...INITIAL_STATIONS, ...storageService.getCustomStations()].find(
-      (s) => s.id === savedId
-    );
-    return found || INITIAL_STATIONS[0];
+    const brokenMap = storageService.getBrokenStations();
+    const savedGlobals = storageService.getSavedGlobalStations();
+    const customs = storageService.getCustomStations();
+    const combined = [
+      ...INITIAL_STATIONS,
+      ...customs,
+      ...Object.values(savedGlobals),
+    ];
+
+    const found = combined.find((s) => s.id === savedId && !brokenMap[s.id]);
+    if (found) return found;
+
+    const firstHealthy = combined.find((s) => !brokenMap[s.id]);
+    return firstHealthy || INITIAL_STATIONS[0];
   });
 
   const [favoriteIds, setFavoriteIds] = useState<string[]>(() =>
@@ -50,11 +93,14 @@ export default function App() {
     storageService.getEQSettings()
   );
 
-  // 2. UI Filter & Modal State
+  // 2. UI Filter, Toast & Modal State
   const [selectedGenre, setSelectedGenre] = useState<GenreFilter>('Todas');
+  const [selectedCountry, setSelectedCountry] = useState<CountryFilter>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [debouncedQuery, setDebouncedQuery] = useState<string>('');
   const [isEQOpen, setIsEQOpen] = useState<boolean>(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // 3. Audio Engine Refs & State
   const [status, setStatus] = useState<PlaybackStatus>('idle');
@@ -65,13 +111,80 @@ export default function App() {
   const hlsRef = useRef<Hls | null>(null);
   const playRequestIdRef = useRef<number>(0);
   const reconnectTimerRef = useRef<number | null>(null);
+  const playbackTimeoutRef = useRef<number | null>(null);
   const userIntendedPlayingRef = useRef<boolean>(false);
+  const consecutiveFailuresRef = useRef<Record<string, number>>({});
+  const toastTimerRef = useRef<number | null>(null);
 
   // Web Audio API Graph Refs
   const audioCtxRef = useRef<AudioContext | null>(null);
   const lowFilterRef = useRef<BiquadFilterNode | null>(null);
   const midFilterRef = useRef<BiquadFilterNode | null>(null);
   const highFilterRef = useRef<BiquadFilterNode | null>(null);
+
+  // Helper to show a discreet toast notification
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setToastMessage(null);
+      toastTimerRef.current = null;
+    }, 4000);
+  }, []);
+
+  // Persist a station into audiocar_saved_stations_v1 whenever played or favorited
+  const persistGlobalStation = useCallback((station: Station) => {
+    setSavedGlobalStations((prev) => {
+      if (prev[station.id]) return prev;
+      const next = { ...prev, [station.id]: station };
+      storageService.setSavedGlobalStations(next);
+      return next;
+    });
+  }, []);
+
+  // Debounce searchQuery by 350ms for Radio Browser API
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedQuery(searchQuery);
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Fetch global stations from Radio Browser API whenever genre, country, or debounced search changes
+  useEffect(() => {
+    if (selectedGenre === 'Favoritas' && !debouncedQuery.trim()) {
+      setIsApiLoading(false);
+      return;
+    }
+
+    const abortController = new AbortController();
+    setIsApiLoading(true);
+
+    radioBrowserService
+      .queryStations({
+        genre: selectedGenre,
+        country: selectedCountry,
+        searchQuery: debouncedQuery,
+        signal: abortController.signal,
+      })
+      .then((results) => {
+        if (!abortController.signal.aborted) {
+          setApiStations(results);
+          setIsApiLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!abortController.signal.aborted) {
+          setIsApiLoading(false);
+        }
+      });
+
+    return () => {
+      abortController.abort();
+    };
+  }, [selectedGenre, selectedCountry, debouncedQuery]);
 
   // Sync themeMode with <html class="dark"> and body background
   useEffect(() => {
@@ -124,17 +237,113 @@ export default function App() {
     return () => window.clearInterval(intervalId);
   }, [status, currentStation.id]);
 
-  // Clear any pending anti-tunnel reconnect timer
-  const clearReconnectTimer = useCallback(() => {
+  // Filtered and Sorted Stations List (excluding broken stations in audiocar_broken_stations_v1)
+  const filteredStations = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+
+    // 1. Filter local/saved stations matching genre, country, query, and NOT in brokenStations
+    const matchingLocal = localAndSavedPool.filter((station) => {
+      if (brokenStations[station.id]) return false;
+
+      if (selectedCountry !== 'ALL') {
+        const stCountry = station.countryCode || 'ES';
+        if (stCountry !== selectedCountry) return false;
+      }
+
+      const matchesQuery =
+        !q ||
+        station.name.toLowerCase().includes(q) ||
+        station.genreLabel.toLowerCase().includes(q) ||
+        station.description.toLowerCase().includes(q);
+
+      if (!matchesQuery) return false;
+
+      if (selectedGenre === 'Favoritas') {
+        const hasTime = (playtimeMap[station.id] || 0) > 0;
+        const isHearted = favoriteIds.includes(station.id);
+        return hasTime || isHearted;
+      }
+
+      if (selectedGenre === 'Todas') return true;
+      if (selectedGenre === 'España') {
+        return (station.countryCode || 'ES') === 'ES';
+      }
+
+      return station.category === selectedGenre;
+    });
+
+    // If viewing "Favoritas" and not typing a global search, return strictly sorted by playtime
+    if (selectedGenre === 'Favoritas' && !q) {
+      return [...matchingLocal].sort((a, b) => {
+        const timeA = playtimeMap[a.id] || 0;
+        const timeB = playtimeMap[b.id] || 0;
+        if (timeB !== timeA) return timeB - timeA;
+        const favA = favoriteIds.includes(a.id) ? 1 : 0;
+        const favB = favoriteIds.includes(b.id) ? 1 : 0;
+        return favB - favA;
+      });
+    }
+
+    // 2. Merge matchingLocal with apiStations (excluding brokenStations and deduplicating by id or streamUrl)
+    const merged: Station[] = [];
+    const seenIds = new Set<string>();
+    const seenUrls = new Set<string>();
+
+    for (const s of matchingLocal) {
+      seenIds.add(s.id);
+      seenUrls.add(s.streamUrl);
+      merged.push(s);
+    }
+
+    for (const s of apiStations) {
+      if (brokenStations[s.id]) continue;
+      if (seenIds.has(s.id) || seenUrls.has(s.streamUrl)) continue;
+      if (
+        q &&
+        !s.name.toLowerCase().includes(q) &&
+        !s.genreLabel.toLowerCase().includes(q) &&
+        !s.description.toLowerCase().includes(q)
+      ) {
+        continue;
+      }
+      seenIds.add(s.id);
+      seenUrls.add(s.streamUrl);
+      merged.push(s);
+    }
+
+    return merged;
+  }, [
+    apiStations,
+    brokenStations,
+    favoriteIds,
+    localAndSavedPool,
+    playtimeMap,
+    searchQuery,
+    selectedCountry,
+    selectedGenre,
+  ]);
+
+  // Keep a ref to filteredStations so failure skip logic always accesses the latest active list
+  const filteredStationsRef = useRef<Station[]>(filteredStations);
+  useEffect(() => {
+    filteredStationsRef.current = filteredStations;
+  }, [filteredStations]);
+
+  // Clear any pending anti-tunnel reconnect timer or 8s timeout watchdog
+  const clearTimers = useCallback(() => {
     if (reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
+    }
+    if (playbackTimeoutRef.current !== null) {
+      window.clearTimeout(playbackTimeoutRef.current);
+      playbackTimeoutRef.current = null;
     }
   }, []);
 
   // Destroy any existing HLS instance and pause previous Audio element
   const teardownCurrentAudio = useCallback(() => {
-    clearReconnectTimer();
+    clearTimers();
     if (hlsRef.current) {
       try {
         hlsRef.current.destroy();
@@ -153,7 +362,7 @@ export default function App() {
       }
       audioRef.current = null;
     }
-  }, [clearReconnectTimer]);
+  }, [clearTimers]);
 
   // Update Tesla MediaSession metadata & playback state
   const updateMediaSession = useCallback(
@@ -243,7 +452,7 @@ export default function App() {
     [eqSettings]
   );
 
-  // Core Atomic Stream Player with CORS fallback, HLS.js support & 3-second Anti-Tunnel Reconnection
+  // Core Atomic Stream Player with CORS fallback, HLS.js, 8s timeout & 3-strike Broken Station Auto-Hide
   const startPlayback = useCallback(
     (
       station: Station,
@@ -260,6 +469,7 @@ export default function App() {
       userIntendedPlayingRef.current = true;
       storageService.setLastStationId(station.id);
       storageService.setWasPlaying(true);
+      persistGlobalStation(station);
 
       setStatus((prev) =>
         prev === 'reconnecting' ? 'reconnecting' : 'loading'
@@ -277,18 +487,74 @@ export default function App() {
 
       audioRef.current = audio;
 
-      const scheduleReconnect = () => {
+      // Handle stream failure or 8s timeout
+      const handleFailureAndRetry = () => {
         if (playRequestIdRef.current !== currentToken) return;
         if (!userIntendedPlayingRef.current) return;
 
-        // If CORS mode failed first, immediately retry once without CORS before entering 3s tunnel loop
+        // If CORS mode failed first, retry immediately once without CORS without penalizing failure count
         if (useCors) {
           startPlayback(station, { isAutoResume: false, useCors: false });
           return;
         }
 
+        // Only count consecutive failures toward the 3-strike blacklist when navigator.onLine === true
+        // so driving through tunnels without coverage never blacklists good stations
+        const isOnline =
+          typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
+
+        if (isOnline) {
+          const prevFails = consecutiveFailuresRef.current[station.id] || 0;
+          const nextFails = prevFails + 1;
+          consecutiveFailuresRef.current[station.id] = nextFails;
+
+          if (nextFails >= 3) {
+            // 1. Blacklist station in localStorage (audiocar_broken_stations_v1)
+            setBrokenStations((prevBroken) => {
+              const updated = {
+                ...prevBroken,
+                [station.id]: {
+                  id: station.id,
+                  name: station.name,
+                  failedAt: Date.now(),
+                },
+              };
+              storageService.setBrokenStations(updated);
+
+              // 3. Automatically skip to the next healthy station in the list
+              const activeList = filteredStationsRef.current.filter(
+                (s) => !updated[s.id] && s.id !== station.id
+              );
+              const fallbackList = INITIAL_STATIONS.filter(
+                (s) => !updated[s.id] && s.id !== station.id
+              );
+              const pool = activeList.length > 0 ? activeList : fallbackList;
+
+              if (pool.length > 0) {
+                const nextStation = pool[0];
+                window.setTimeout(() => {
+                  setCurrentStation(nextStation);
+                  storageService.setLastStationId(nextStation.id);
+                  startPlayback(nextStation, {
+                    isAutoResume: false,
+                    useCors: false,
+                  });
+                }, 150);
+              } else {
+                setStatus('error');
+              }
+
+              return updated;
+            });
+
+            // 2. Show discreet toast message
+            showToast('Emisora sin señal — ocultada de la lista');
+            return;
+          }
+        }
+
         setStatus('reconnecting');
-        clearReconnectTimer();
+        clearTimers();
         reconnectTimerRef.current = window.setTimeout(() => {
           if (
             playRequestIdRef.current === currentToken &&
@@ -297,6 +563,32 @@ export default function App() {
             startPlayback(station, { isAutoResume: false, useCors: false });
           }
         }, 3000);
+      };
+
+      // Start 8-second connection watchdog timer while loading
+      playbackTimeoutRef.current = window.setTimeout(() => {
+        if (playRequestIdRef.current !== currentToken) return;
+        if (audio.paused || audio.readyState < 2) {
+          handleFailureAndRetry();
+        }
+      }, 8000);
+
+      const handleSuccessPlaying = () => {
+        if (playRequestIdRef.current !== currentToken) return;
+        clearTimers();
+
+        // Reset failure count to 0 and remove from broken stations if present
+        consecutiveFailuresRef.current[station.id] = 0;
+        setBrokenStations((prev) => {
+          if (!prev[station.id]) return prev;
+          const copy = { ...prev };
+          delete copy[station.id];
+          storageService.setBrokenStations(copy);
+          return copy;
+        });
+
+        setStatus('playing');
+        updateMediaSession(station, 'playing');
       };
 
       const attemptPlay = () => {
@@ -314,9 +606,7 @@ export default function App() {
                 audio.pause();
                 return;
               }
-              clearReconnectTimer();
-              setStatus('playing');
-              updateMediaSession(station, 'playing');
+              handleSuccessPlaying();
             })
             .catch((err: Error) => {
               if (playRequestIdRef.current !== currentToken) return;
@@ -325,21 +615,17 @@ export default function App() {
                 err.name === 'NotAllowedError' ||
                 (isAutoResume && err.message?.toLowerCase().includes('interact'))
               ) {
+                clearTimers();
                 setStatus('autoplay_blocked');
                 return;
               }
-              scheduleReconnect();
+              handleFailureAndRetry();
             });
         }
       };
 
       // Attach resilient event listeners
-      audio.addEventListener('playing', () => {
-        if (playRequestIdRef.current !== currentToken) return;
-        clearReconnectTimer();
-        setStatus('playing');
-        updateMediaSession(station, 'playing');
-      });
+      audio.addEventListener('playing', handleSuccessPlaying);
 
       audio.addEventListener('waiting', () => {
         if (playRequestIdRef.current !== currentToken) return;
@@ -351,20 +637,20 @@ export default function App() {
       audio.addEventListener('stalled', () => {
         if (playRequestIdRef.current !== currentToken) return;
         if (userIntendedPlayingRef.current && audio.paused) {
-          scheduleReconnect();
+          handleFailureAndRetry();
         }
       });
 
       audio.addEventListener('ended', () => {
         if (playRequestIdRef.current !== currentToken) return;
         if (userIntendedPlayingRef.current) {
-          scheduleReconnect();
+          handleFailureAndRetry();
         }
       });
 
       audio.addEventListener('error', () => {
         if (playRequestIdRef.current !== currentToken) return;
-        scheduleReconnect();
+        handleFailureAndRetry();
       });
 
       const isHlsStream =
@@ -393,13 +679,13 @@ export default function App() {
             if (data.fatal) {
               switch (data.type) {
                 case Hls.ErrorTypes.NETWORK_ERROR:
-                  scheduleReconnect();
+                  handleFailureAndRetry();
                   break;
                 case Hls.ErrorTypes.MEDIA_ERROR:
                   hls.recoverMediaError();
                   break;
                 default:
-                  scheduleReconnect();
+                  handleFailureAndRetry();
                   break;
               }
             }
@@ -408,7 +694,7 @@ export default function App() {
           audio.src = station.streamUrl;
           attemptPlay();
         } else {
-          setStatus('error');
+          handleFailureAndRetry();
         }
       } else {
         audio.src = station.streamUrl;
@@ -417,8 +703,10 @@ export default function App() {
     },
     [
       attachWebAudioGraph,
-      clearReconnectTimer,
+      clearTimers,
       isMuted,
+      persistGlobalStation,
+      showToast,
       teardownCurrentAudio,
       updateMediaSession,
       volume,
@@ -438,9 +726,11 @@ export default function App() {
   // Select a new station and play immediately (atomic switch)
   const handleSelectStation = useCallback(
     (station: Station) => {
+      consecutiveFailuresRef.current[station.id] = 0;
       setCurrentStation(station);
       storageService.setLastStationId(station.id);
-      // Try Web Audio CORS mode first if it's HLS (like Onda Cero) or if user adjusted EQ
+      persistGlobalStation(station);
+
       const tryCors =
         station.isHls ||
         eqSettings.low !== 0 ||
@@ -448,7 +738,7 @@ export default function App() {
         eqSettings.high !== 0;
       startPlayback(station, { isAutoResume: false, useCors: tryCors });
     },
-    [eqSettings, startPlayback]
+    [eqSettings, persistGlobalStation, startPlayback]
   );
 
   const handleTogglePlay = useCallback(() => {
@@ -459,6 +749,7 @@ export default function App() {
     ) {
       pausePlayback();
     } else {
+      consecutiveFailuresRef.current[currentStation.id] = 0;
       const tryCors =
         currentStation.isHls ||
         eqSettings.low !== 0 ||
@@ -468,57 +759,32 @@ export default function App() {
     }
   }, [currentStation, eqSettings, pausePlayback, startPlayback, status]);
 
-  // Filtered and Sorted Stations List
-  // When "Favoritas" is active, sorts strictly by accumulated device listening time descending
-  const filteredStations = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-
-    const list = allStations.filter((station) => {
-      const matchesQuery =
-        !q ||
-        station.name.toLowerCase().includes(q) ||
-        station.genreLabel.toLowerCase().includes(q) ||
-        station.description.toLowerCase().includes(q);
-
-      if (!matchesQuery) return false;
-
-      if (selectedGenre === 'Todas') return true;
-      if (selectedGenre === 'Favoritas') {
-        const hasTime = (playtimeMap[station.id] || 0) > 0;
-        const isHearted = favoriteIds.includes(station.id);
-        return hasTime || isHearted;
-      }
-      return station.category === selectedGenre;
-    });
-
-    if (selectedGenre === 'Favoritas') {
-      return [...list].sort((a, b) => {
-        const timeA = playtimeMap[a.id] || 0;
-        const timeB = playtimeMap[b.id] || 0;
-        if (timeB !== timeA) return timeB - timeA;
-        const favA = favoriteIds.includes(a.id) ? 1 : 0;
-        const favB = favoriteIds.includes(b.id) ? 1 : 0;
-        return favB - favA;
-      });
-    }
-
-    return list;
-  }, [allStations, favoriteIds, playtimeMap, searchQuery, selectedGenre]);
-
   // Navigate Previous / Next Station (also triggered by Tesla steering wheel buttons)
   const handlePrevStation = useCallback(() => {
-    const list = filteredStations.length > 0 ? filteredStations : allStations;
+    const healthyFallback = INITIAL_STATIONS.filter(
+      (s) => !brokenStations[s.id]
+    );
+    const list =
+      filteredStations.length > 0 ? filteredStations : healthyFallback;
+    if (list.length === 0) return;
+
     const idx = list.findIndex((s) => s.id === currentStation.id);
     const prevIndex = idx <= 0 ? list.length - 1 : idx - 1;
     handleSelectStation(list[prevIndex]);
-  }, [allStations, currentStation.id, filteredStations, handleSelectStation]);
+  }, [brokenStations, currentStation.id, filteredStations, handleSelectStation]);
 
   const handleNextStation = useCallback(() => {
-    const list = filteredStations.length > 0 ? filteredStations : allStations;
+    const healthyFallback = INITIAL_STATIONS.filter(
+      (s) => !brokenStations[s.id]
+    );
+    const list =
+      filteredStations.length > 0 ? filteredStations : healthyFallback;
+    if (list.length === 0) return;
+
     const idx = list.findIndex((s) => s.id === currentStation.id);
     const nextIndex = idx === -1 || idx >= list.length - 1 ? 0 : idx + 1;
     handleSelectStation(list[nextIndex]);
-  }, [allStations, currentStation.id, filteredStations, handleSelectStation]);
+  }, [brokenStations, currentStation.id, filteredStations, handleSelectStation]);
 
   // Register Tesla Steering Wheel MediaSession Action Handlers
   useEffect(() => {
@@ -561,20 +827,21 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Toggle favorite heart
+  // Toggle favorite heart and save full station metadata into audiocar_saved_stations_v1
   const handleToggleFavorite = useCallback(
-    (stationId: string, e?: React.MouseEvent) => {
+    (station: Station, e?: React.MouseEvent) => {
       if (e) e.stopPropagation();
+      persistGlobalStation(station);
       setFavoriteIds((prev) => {
-        const exists = prev.includes(stationId);
+        const exists = prev.includes(station.id);
         const next = exists
-          ? prev.filter((id) => id !== stationId)
-          : [...prev, stationId];
+          ? prev.filter((id) => id !== station.id)
+          : [...prev, station.id];
         storageService.setFavoriteIds(next);
         return next;
       });
     },
-    []
+    [persistGlobalStation]
   );
 
   // Add custom station by URL
@@ -600,14 +867,27 @@ export default function App() {
         return next;
       });
       if (currentStation.id === stationId) {
-        handleSelectStation(INITIAL_STATIONS[0]);
+        const firstHealthy =
+          INITIAL_STATIONS.find((s) => !brokenStations[s.id]) ||
+          INITIAL_STATIONS[0];
+        handleSelectStation(firstHealthy);
       }
     },
-    [currentStation.id, handleSelectStation]
+    [brokenStations, currentStation.id, handleSelectStation]
   );
 
+  // Restore all hidden broken stations with a single tap
+  const handleRestoreBrokenStations = useCallback(() => {
+    consecutiveFailuresRef.current = {};
+    setBrokenStations({});
+    storageService.setBrokenStations({});
+    showToast('Emisoras ocultas restauradas en la lista');
+  }, [showToast]);
+
+  const brokenCount = Object.keys(brokenStations).length;
+
   return (
-    <div className="min-h-screen lg:h-screen w-full flex flex-col bg-[#F4F6F9] dark:bg-[#121316] text-[#0F172A] dark:text-slate-100 select-none overflow-x-hidden lg:overflow-hidden">
+    <div className="min-h-screen lg:h-screen w-full flex flex-col bg-[#F4F6F9] dark:bg-[#121316] text-[#0F172A] dark:text-slate-100 select-none overflow-x-hidden lg:overflow-hidden relative">
       {/* Compact Automotive Top Header Bar */}
       <HeaderBar
         status={status}
@@ -618,6 +898,18 @@ export default function App() {
         onOpenEQ={() => setIsEQOpen(true)}
         eqSettings={eqSettings}
       />
+
+      {/* Discreet Automotive Toast Alert for Auto-Hidden Broken Stations */}
+      {toastMessage && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-5 right-5 z-50 px-4 py-3 rounded-2xl bg-[#0F172A] dark:bg-[#1C1E22] text-white border border-amber-500/40 shadow-xl flex items-center gap-2.5 text-xs sm:text-sm font-semibold"
+        >
+          <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
 
       {/* Main Split Cabin Layout:
           - Mobile Vertical (<1024px): Vertical Split View (Main Player on Top, Station List on Bottom)
@@ -640,27 +932,30 @@ export default function App() {
             }}
             onToggleMute={() => setIsMuted((m) => !m)}
             isFavorite={favoriteIds.includes(currentStation.id)}
-            onToggleFavorite={() => handleToggleFavorite(currentStation.id)}
+            onToggleFavorite={() => handleToggleFavorite(currentStation)}
             listeningSeconds={playtimeMap[currentStation.id] || 0}
             analyser={analyserState}
             isWebAudioActive={isWebAudioActive}
             isDayMode={themeMode === 'day'}
             eqSettings={eqSettings}
             onOpenEQ={() => setIsEQOpen(true)}
-            onRetryPlay={() =>
-              startPlayback(currentStation, { isAutoResume: false })
-            }
+            onRetryPlay={() => {
+              consecutiveFailuresRef.current[currentStation.id] = 0;
+              startPlayback(currentStation, { isAutoResume: false });
+            }}
           />
         </div>
 
         {/* Left Panel on Desktop (40%) / Bottom Panel on Mobile */}
-        <div className="w-full lg:w-[40%] lg:order-1 flex flex-col flex-1 min-h-[420px] lg:min-h-0 lg:h-full">
+        <div className="w-full lg:w-[40%] lg:order-1 flex flex-col flex-1 min-h-[440px] lg:min-h-0 lg:h-full">
           <StationBrowser
             stations={filteredStations}
             currentStation={currentStation}
             status={status}
             selectedGenre={selectedGenre}
             onSelectGenre={setSelectedGenre}
+            selectedCountry={selectedCountry}
+            onSelectCountry={setSelectedCountry}
             searchQuery={searchQuery}
             onSearchChange={setSearchQuery}
             onSelectStation={handleSelectStation}
@@ -669,6 +964,9 @@ export default function App() {
             playtimeMap={playtimeMap}
             onOpenAddModal={() => setIsAddModalOpen(true)}
             onDeleteCustomStation={handleDeleteCustomStation}
+            isApiLoading={isApiLoading}
+            brokenCount={brokenCount}
+            onRestoreBrokenStations={handleRestoreBrokenStations}
           />
         </div>
       </main>

@@ -1,4 +1,4 @@
-import { EQSettings, Station } from '../types/radio';
+import { BrokenStationEntry, EQSettings, Station } from '../types/radio';
 
 const KEYS = {
   LAST_STATION_ID: 'audiocar_last_station_id',
@@ -6,6 +6,8 @@ const KEYS = {
   FAVORITE_IDS: 'audiocar_favorites',
   PLAYTIME_MAP: 'audiocar_playtime_seconds',
   CUSTOM_STATIONS: 'audiocar_custom_stations',
+  SAVED_GLOBAL_STATIONS: 'audiocar_saved_stations_v1',
+  BROKEN_STATIONS: 'audiocar_broken_stations_v1',
   THEME_MODE: 'audiocar_theme_mode',
   VOLUME: 'audiocar_volume',
   EQ_SETTINGS: 'audiocar_eq_settings',
@@ -69,6 +71,20 @@ export const storageService = {
   },
   setCustomStations(stations: Station[]): void {
     safeSetItem(KEYS.CUSTOM_STATIONS, stations);
+  },
+
+  getSavedGlobalStations(): Record<string, Station> {
+    return safeGetItem<Record<string, Station>>(KEYS.SAVED_GLOBAL_STATIONS, {});
+  },
+  setSavedGlobalStations(stationsMap: Record<string, Station>): void {
+    safeSetItem(KEYS.SAVED_GLOBAL_STATIONS, stationsMap);
+  },
+
+  getBrokenStations(): Record<string, BrokenStationEntry> {
+    return safeGetItem<Record<string, BrokenStationEntry>>(KEYS.BROKEN_STATIONS, {});
+  },
+  setBrokenStations(brokenMap: Record<string, BrokenStationEntry>): void {
+    safeSetItem(KEYS.BROKEN_STATIONS, brokenMap);
   },
 
   getThemeMode(): 'night' | 'day' {
