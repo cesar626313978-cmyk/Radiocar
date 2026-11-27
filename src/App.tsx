@@ -101,6 +101,7 @@ export default function App() {
   const [isEQOpen, setIsEQOpen] = useState<boolean>(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [mobileView, setMobileView] = useState<'player' | 'stations'>('player');
 
   // 3. Audio Engine Refs & State
   const [status, setStatus] = useState<PlaybackStatus>('idle');
@@ -115,6 +116,16 @@ export default function App() {
   const userIntendedPlayingRef = useRef<boolean>(false);
   const consecutiveFailuresRef = useRef<Record<string, number>>({});
   const toastTimerRef = useRef<number | null>(null);
+  const currentStationRef = useRef<Station>(currentStation);
+  const eqSettingsRef = useRef<EQSettings>(eqSettings);
+
+  useEffect(() => {
+    currentStationRef.current = currentStation;
+  }, [currentStation]);
+
+  useEffect(() => {
+    eqSettingsRef.current = eqSettings;
+  }, [eqSettings]);
 
   // Web Audio API Graph Refs
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -471,6 +482,9 @@ export default function App() {
       storageService.setWasPlaying(true);
       persistGlobalStation(station);
 
+      // Immediately update MediaSession to 'playing' with full metadata so Tesla steering wheel & media widget stay active
+      updateMediaSession(station, 'playing');
+
       setStatus((prev) =>
         prev === 'reconnecting' ? 'reconnecting' : 'loading'
       );
@@ -533,6 +547,7 @@ export default function App() {
               if (pool.length > 0) {
                 const nextStation = pool[0];
                 window.setTimeout(() => {
+                  currentStationRef.current = nextStation;
                   setCurrentStation(nextStation);
                   storageService.setLastStationId(nextStation.id);
                   startPlayback(nextStation, {
@@ -617,6 +632,7 @@ export default function App() {
               ) {
                 clearTimers();
                 setStatus('autoplay_blocked');
+                updateMediaSession(station, 'paused');
                 return;
               }
               handleFailureAndRetry();
@@ -713,33 +729,62 @@ export default function App() {
     ]
   );
 
-  // Stop / Pause active playback cleanly
+  // Stop / Pause active playback WITHOUT destroying the HTMLAudioElement or MediaSession
+  // so Tesla OS retains the active media session and delivers the next steering wheel 'play' click
   const pausePlayback = useCallback(() => {
     playRequestIdRef.current += 1;
     userIntendedPlayingRef.current = false;
     storageService.setWasPlaying(false);
-    teardownCurrentAudio();
-    setStatus('paused');
-    updateMediaSession(currentStation, 'paused');
-  }, [currentStation, teardownCurrentAudio, updateMediaSession]);
+    clearTimers();
 
-  // Select a new station and play immediately (atomic switch)
+    if (hlsRef.current) {
+      try {
+        hlsRef.current.stopLoad();
+      } catch {
+        // Ignore hls stopLoad error
+      }
+    }
+
+    if (audioRef.current) {
+      try {
+        audioRef.current.pause();
+      } catch {
+        // Ignore audio pause error
+      }
+    }
+
+    setStatus('paused');
+    updateMediaSession(currentStationRef.current, 'paused');
+  }, [clearTimers, updateMediaSession]);
+
+  // Select a new station and play immediately (atomic switch), switching automatically to player view on <1024px
   const handleSelectStation = useCallback(
     (station: Station) => {
       consecutiveFailuresRef.current[station.id] = 0;
+      currentStationRef.current = station;
       setCurrentStation(station);
       storageService.setLastStationId(station.id);
       persistGlobalStation(station);
+      setMobileView('player');
 
+      const eq = eqSettingsRef.current;
       const tryCors =
-        station.isHls ||
-        eqSettings.low !== 0 ||
-        eqSettings.mid !== 0 ||
-        eqSettings.high !== 0;
+        station.isHls || eq.low !== 0 || eq.mid !== 0 || eq.high !== 0;
       startPlayback(station, { isAutoResume: false, useCors: tryCors });
     },
-    [eqSettings, persistGlobalStation, startPlayback]
+    [persistGlobalStation, startPlayback]
   );
+
+  // Resume or tune active station in currentStationRef (reloads live stream with atomic token)
+  const playCurrentStationFromRef = useCallback(() => {
+    const activeStation = currentStationRef.current;
+    consecutiveFailuresRef.current[activeStation.id] = 0;
+    const eq = eqSettingsRef.current;
+    const tryCors =
+      activeStation.isHls || eq.low !== 0 || eq.mid !== 0 || eq.high !== 0;
+    updateMediaSession(activeStation, 'playing');
+    startPlayback(activeStation, { isAutoResume: false, useCors: tryCors });
+  }, [startPlayback, updateMediaSession]);
 
   const handleTogglePlay = useCallback(() => {
     if (
@@ -749,15 +794,9 @@ export default function App() {
     ) {
       pausePlayback();
     } else {
-      consecutiveFailuresRef.current[currentStation.id] = 0;
-      const tryCors =
-        currentStation.isHls ||
-        eqSettings.low !== 0 ||
-        eqSettings.mid !== 0 ||
-        eqSettings.high !== 0;
-      startPlayback(currentStation, { isAutoResume: false, useCors: tryCors });
+      playCurrentStationFromRef();
     }
-  }, [currentStation, eqSettings, pausePlayback, startPlayback, status]);
+  }, [pausePlayback, playCurrentStationFromRef, status]);
 
   // Navigate Previous / Next Station (also triggered by Tesla steering wheel buttons)
   const handlePrevStation = useCallback(() => {
@@ -765,54 +804,79 @@ export default function App() {
       (s) => !brokenStations[s.id]
     );
     const list =
-      filteredStations.length > 0 ? filteredStations : healthyFallback;
+      filteredStationsRef.current.length > 0
+        ? filteredStationsRef.current
+        : healthyFallback;
     if (list.length === 0) return;
 
-    const idx = list.findIndex((s) => s.id === currentStation.id);
+    const activeId = currentStationRef.current.id;
+    const idx = list.findIndex((s) => s.id === activeId);
     const prevIndex = idx <= 0 ? list.length - 1 : idx - 1;
     handleSelectStation(list[prevIndex]);
-  }, [brokenStations, currentStation.id, filteredStations, handleSelectStation]);
+  }, [brokenStations, handleSelectStation]);
 
   const handleNextStation = useCallback(() => {
     const healthyFallback = INITIAL_STATIONS.filter(
       (s) => !brokenStations[s.id]
     );
     const list =
-      filteredStations.length > 0 ? filteredStations : healthyFallback;
+      filteredStationsRef.current.length > 0
+        ? filteredStationsRef.current
+        : healthyFallback;
     if (list.length === 0) return;
 
-    const idx = list.findIndex((s) => s.id === currentStation.id);
+    const activeId = currentStationRef.current.id;
+    const idx = list.findIndex((s) => s.id === activeId);
     const nextIndex = idx === -1 || idx >= list.length - 1 ? 0 : idx + 1;
     handleSelectStation(list[nextIndex]);
-  }, [brokenStations, currentStation.id, filteredStations, handleSelectStation]);
+  }, [brokenStations, handleSelectStation]);
 
-  // Register Tesla Steering Wheel MediaSession Action Handlers
+  // Keep latest handlers in refs so MediaSession listeners registered once on mount never go stale
+  const playHandlerRef = useRef(playCurrentStationFromRef);
+  const pauseHandlerRef = useRef(pausePlayback);
+  const prevHandlerRef = useRef(handlePrevStation);
+  const nextHandlerRef = useRef(handleNextStation);
+
+  useEffect(() => {
+    playHandlerRef.current = playCurrentStationFromRef;
+    pauseHandlerRef.current = pausePlayback;
+    prevHandlerRef.current = handlePrevStation;
+    nextHandlerRef.current = handleNextStation;
+  }, [
+    playCurrentStationFromRef,
+    pausePlayback,
+    handlePrevStation,
+    handleNextStation,
+  ]);
+
+  // Register Tesla Steering Wheel MediaSession Action Handlers ONCE on mount
   useEffect(() => {
     try {
       if ('mediaSession' in navigator) {
+        updateMediaSession(currentStationRef.current, 'paused');
+
         navigator.mediaSession.setActionHandler('play', () => {
-          startPlayback(currentStation, { isAutoResume: false });
+          playHandlerRef.current();
         });
         navigator.mediaSession.setActionHandler('pause', () => {
-          pausePlayback();
+          pauseHandlerRef.current();
+        });
+        navigator.mediaSession.setActionHandler('stop', () => {
+          pauseHandlerRef.current();
         });
         navigator.mediaSession.setActionHandler('previoustrack', () => {
-          handlePrevStation();
+          prevHandlerRef.current();
         });
         navigator.mediaSession.setActionHandler('nexttrack', () => {
-          handleNextStation();
+          nextHandlerRef.current();
         });
       }
     } catch {
       // Ignore unsupported mediaSession handlers
     }
-  }, [
-    currentStation,
-    handleNextStation,
-    handlePrevStation,
-    pausePlayback,
-    startPlayback,
-  ]);
+    // Registered strictly once on mount, reading from refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Vehicle Entry Auto-Resume on Initial Mount
   useEffect(() => {
@@ -887,8 +951,8 @@ export default function App() {
   const brokenCount = Object.keys(brokenStations).length;
 
   return (
-    <div className="min-h-screen lg:h-screen w-full flex flex-col bg-[#F4F6F9] dark:bg-[#121316] text-[#0F172A] dark:text-slate-100 select-none overflow-x-hidden lg:overflow-hidden relative">
-      {/* Compact Automotive Top Header Bar */}
+    <div className="h-[100dvh] w-full max-w-full flex flex-col bg-[#F4F6F9] dark:bg-[#121316] text-[#0F172A] dark:text-slate-100 select-none overflow-hidden relative">
+      {/* Compact Automotive Top Header Bar (64px / h-16) */}
       <HeaderBar
         status={status}
         themeMode={themeMode}
@@ -897,6 +961,10 @@ export default function App() {
         }
         onOpenEQ={() => setIsEQOpen(true)}
         eqSettings={eqSettings}
+        mobileView={mobileView}
+        onToggleMobileView={() =>
+          setMobileView((v) => (v === 'player' ? 'stations' : 'player'))
+        }
       />
 
       {/* Discreet Automotive Toast Alert for Auto-Hidden Broken Stations */}
@@ -911,13 +979,17 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Split Cabin Layout:
-          - Mobile Vertical (<1024px): Vertical Split View (Main Player on Top, Station List on Bottom)
-          - Tesla Widescreen (>=1024px): Left Panel 40% (Stations) / Right Panel 60% (Main Player)
+      {/* Main Cabin Layout:
+          - Driving Split-Screen / Mobile (<1024px): Single toggleable view inside calc(100dvh - 64px) with zero vertical scroll
+          - Tesla Full Widescreen (>=1024px): Left Panel 40% (Stations) / Right Panel 60% (Main Player)
       */}
-      <main className="flex-1 w-full max-w-[1920px] mx-auto p-3 sm:p-4 lg:p-6 flex flex-col lg:flex-row gap-4 lg:gap-6 lg:overflow-hidden">
-        {/* Right Panel on Desktop (60%) / Top Panel on Mobile */}
-        <div className="w-full lg:w-[60%] lg:order-2 flex flex-col shrink-0 lg:h-full">
+      <main className="h-[calc(100dvh-64px)] w-full max-w-[1920px] mx-auto p-2.5 sm:p-4 lg:p-6 flex flex-col lg:flex-row gap-4 lg:gap-6 overflow-hidden">
+        {/* Right Panel on Desktop (60%) / Toggleable Player View on <1024px */}
+        <div
+          className={`${
+            mobileView === 'player' ? 'flex' : 'hidden'
+          } lg:flex w-full lg:w-[60%] lg:order-2 flex-col h-full overflow-hidden`}
+        >
           <MainPlayer
             station={currentStation}
             status={status}
@@ -946,8 +1018,12 @@ export default function App() {
           />
         </div>
 
-        {/* Left Panel on Desktop (40%) / Bottom Panel on Mobile */}
-        <div className="w-full lg:w-[40%] lg:order-1 flex flex-col flex-1 min-h-[440px] lg:min-h-0 lg:h-full">
+        {/* Left Panel on Desktop (40%) / Toggleable Stations View on <1024px */}
+        <div
+          className={`${
+            mobileView === 'stations' ? 'flex' : 'hidden'
+          } lg:flex w-full lg:w-[40%] lg:order-1 flex-col h-full overflow-hidden`}
+        >
           <StationBrowser
             stations={filteredStations}
             currentStation={currentStation}

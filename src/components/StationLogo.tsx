@@ -18,7 +18,7 @@ export const StationLogo: React.FC<StationLogoProps> = ({
     sm: 'w-11 h-11 rounded-xl text-xs',
     md: 'w-13 h-13 rounded-xl text-sm',
     lg: 'w-20 h-20 rounded-2xl text-xl',
-    xl: 'w-24 h-24 sm:w-28 sm:h-28 rounded-3xl text-2xl',
+    xl: 'w-16 h-16 sm:w-20 sm:h-20 lg:w-28 lg:h-28 rounded-2xl lg:rounded-3xl text-lg lg:text-2xl',
   }[size];
 
   const showFallback = !station.logoUrl || imgFailed;

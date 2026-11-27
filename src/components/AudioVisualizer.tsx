@@ -121,7 +121,7 @@ export const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
   }, [analyser, status, accentColor, isWebAudioActive, isDayMode]);
 
   return (
-    <div className="relative w-full h-16 sm:h-20 lg:h-24 flex items-center justify-center px-3 py-2 rounded-2xl bg-[#F4F6F9] dark:bg-[#121316] border border-[#E2E8F0] dark:border-[#2A2D34] overflow-hidden">
+    <div className="relative w-full h-14 sm:h-16 lg:h-24 flex items-center justify-center px-3 py-1.5 lg:py-2 rounded-2xl bg-[#F4F6F9] dark:bg-[#121316] border border-[#E2E8F0] dark:border-[#2A2D34] overflow-hidden">
       <canvas
         ref={canvasRef}
         className="w-full h-full block"
