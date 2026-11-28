@@ -1,0 +1,10 @@
+{
+  "name": "AudioCar Radio",
+  "short_name": "AudioCar Radio",
+  "description": "Reproductor de radio online de grado automotriz diseñado para la pantalla central del Tesla Model 3, tablets y dispositivos móviles.",
+  "start_url": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#121316",
+  "theme_color": "#121316"
+}

@@ -210,13 +210,13 @@ export const MainPlayer: React.FC<MainPlayerProps> = ({
           <button
             type="button"
             onClick={onTogglePlay}
-            className="min-w-[72px] min-h-[72px] sm:min-w-[80px] sm:min-h-[80px] lg:min-w-[96px] lg:min-h-[96px] px-6 lg:px-8 rounded-3xl bg-[#4DA8FF] hover:bg-[#3b97f2] text-slate-950 font-extrabold flex items-center justify-center gap-3 shadow-lg shadow-[#4DA8FF]/20 transition-transform active:scale-95"
+            className="min-w-[84px] min-h-[84px] lg:min-w-[96px] lg:min-h-[96px] px-6 lg:px-8 rounded-3xl bg-[#4DA8FF] hover:bg-[#3b97f2] text-slate-950 font-extrabold flex items-center justify-center gap-3 shadow-lg shadow-[#4DA8FF]/20 transition-transform active:scale-95"
             aria-label={isPlaying ? 'Pausar emisora' : 'Reproducir emisora'}
           >
             {isPlaying || isLoading ? (
-              <Pause className="w-8 h-8 lg:w-10 lg:h-10 fill-current" />
+              <Pause className="w-9 h-9 lg:w-10 lg:h-10 fill-current" />
             ) : (
-              <Play className="w-8 h-8 lg:w-10 lg:h-10 fill-current ml-1" />
+              <Play className="w-9 h-9 lg:w-10 lg:h-10 fill-current ml-1" />
             )}
           </button>
 

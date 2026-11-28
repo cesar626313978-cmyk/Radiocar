@@ -103,6 +103,29 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<'player' | 'stations'>('player');
 
+  // Smart panoramic detection: >=1024px OR tablet in landscape (min-width: 740px and min-height: 480px)
+  const LANDSCAPE_WIDE_QUERY =
+    '(min-width: 1024px), ((orientation: landscape) and (min-width: 740px) and (min-height: 480px))';
+
+  const [isLandscapeWide, setIsLandscapeWide] = useState<boolean>(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return true;
+    return window.matchMedia(LANDSCAPE_WIDE_QUERY).matches;
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mql = window.matchMedia(LANDSCAPE_WIDE_QUERY);
+    const handleChange = (e: MediaQueryListEvent | MediaQueryList) => {
+      setIsLandscapeWide(e.matches);
+    };
+    handleChange(mql);
+    mql.addEventListener('change', handleChange);
+    window.addEventListener('resize', () => handleChange(mql));
+    return () => {
+      mql.removeEventListener('change', handleChange);
+    };
+  }, [LANDSCAPE_WIDE_QUERY]);
+
   // 3. Audio Engine Refs & State
   const [status, setStatus] = useState<PlaybackStatus>('idle');
   const [isWebAudioActive, setIsWebAudioActive] = useState<boolean>(false);
@@ -952,7 +975,7 @@ export default function App() {
 
   return (
     <div className="h-[100dvh] w-full max-w-full flex flex-col bg-[#F4F6F9] dark:bg-[#121316] text-[#0F172A] dark:text-slate-100 select-none overflow-hidden relative">
-      {/* Compact Automotive Top Header Bar (64px / h-16) */}
+      {/* Compact Automotive Top Header Bar */}
       <HeaderBar
         status={status}
         themeMode={themeMode}
@@ -965,6 +988,7 @@ export default function App() {
         onToggleMobileView={() =>
           setMobileView((v) => (v === 'player' ? 'stations' : 'player'))
         }
+        isLandscapeWide={isLandscapeWide}
       />
 
       {/* Discreet Automotive Toast Alert for Auto-Hidden Broken Stations */}
@@ -980,15 +1004,21 @@ export default function App() {
       )}
 
       {/* Main Cabin Layout:
-          - Driving Split-Screen / Mobile (<1024px): Single toggleable view inside remaining viewport height with zero vertical scroll
-          - Tesla Full Widescreen (>=1024px): Left Panel 40% (Stations) / Right Panel 60% (Main Player)
+          - Portrait Tablet / Phone / Narrow Tesla Driving Split (<740px): Single toggleable view (!isLandscapeWide)
+          - Panoramic 2-Column (isLandscapeWide: >=1024px OR Tablet Landscape >=740x480): Left Panel 40% (Stations) / Right Panel 60% (Main Player)
       */}
-      <main className="flex-1 min-h-0 w-full max-w-[1920px] mx-auto p-2.5 sm:p-4 lg:p-6 flex flex-col lg:flex-row gap-4 lg:gap-6 overflow-hidden">
-        {/* Right Panel on Desktop (60%) / Toggleable Player View on <1024px */}
+      <main
+        className={`flex-1 min-h-0 w-full max-w-[1920px] mx-auto p-2.5 sm:p-4 lg:p-6 flex ${
+          isLandscapeWide ? 'flex-row' : 'flex-col'
+        } gap-3 sm:gap-4 lg:gap-6 overflow-hidden`}
+      >
+        {/* Right Panel in Panoramic (60%) / Toggleable Player View when !isLandscapeWide */}
         <div
           className={`${
-            mobileView === 'player' ? 'flex' : 'hidden'
-          } lg:flex w-full lg:w-[60%] lg:order-2 flex-col h-full overflow-hidden`}
+            isLandscapeWide || mobileView === 'player' ? 'flex' : 'hidden'
+          } ${
+            isLandscapeWide ? 'w-[60%] order-2' : 'w-full'
+          } flex-col h-full overflow-hidden`}
         >
           <MainPlayer
             station={currentStation}
@@ -1018,11 +1048,13 @@ export default function App() {
           />
         </div>
 
-        {/* Left Panel on Desktop (40%) / Toggleable Stations View on <1024px */}
+        {/* Left Panel in Panoramic (40%) / Toggleable Stations View when !isLandscapeWide */}
         <div
           className={`${
-            mobileView === 'stations' ? 'flex' : 'hidden'
-          } lg:flex w-full lg:w-[40%] lg:order-1 flex-col h-full overflow-hidden`}
+            isLandscapeWide || mobileView === 'stations' ? 'flex' : 'hidden'
+          } ${
+            isLandscapeWide ? 'w-[40%] order-1' : 'w-full'
+          } flex-col h-full overflow-hidden`}
         >
           <StationBrowser
             stations={filteredStations}
